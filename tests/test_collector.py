@@ -7,8 +7,9 @@ Runs entirely on the local filesystem + SQLite (no Docker needed):
 * rotation by rename: old inode keeps draining, new file starts at offset 0
 * collector exit at arbitrary points resumes without gaps or duplicates
 * identical content lines are stored as separate rows
-* committed data only is visible to queries (transactional)
-* FastAPI query/pagination/progress endpoints work
+* transaction isolation: queries see committed data only, one response
+  comes from one snapshot, readers and the writer never block each other
+* FastAPI query/pagination/progress + /demo isolation endpoints work
 """
 
 from __future__ import annotations
@@ -45,6 +46,11 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 def jline(path: str, status: int, ts: str = "2026-11-13T10:00:00Z") -> str:
     return json.dumps({"time": ts, "path": path, "status": status,
                        "method": "GET"}) + "\n"
+
+
+def _post(url: str):
+    req = urllib.request.Request(url, method="POST")
+    return json.load(urllib.request.urlopen(req))
 
 
 def fresh_env():
@@ -405,13 +411,64 @@ def test_api():
         check("single event returns raw JSON line",
               json.loads(one["raw_line"])["path"] == "/api/orders")
 
-        code = urllib.request.urlopen(
-            "http://127.0.0.1:8765/events/999999").getcode()
-    except urllib.error.HTTPError as e:
-        code = e.code
-        check("unknown event id -> 404", code == 404, str(code))
-    else:
-        check("unknown event id -> 404", False, f"got {code}")
+        try:
+            urllib.request.urlopen("http://127.0.0.1:8765/events/999999")
+            check("unknown event id -> 404", False, "no error raised")
+        except urllib.error.HTTPError as e:
+            check("unknown event id -> 404", e.code == 404, str(e.code))
+
+        print("    [7b] 事务隔离（demo 端点）：未提交不可见 / 快照一致 / 回滚消失")
+        base_url = "http://127.0.0.1:8765"
+        held = _post(f"{base_url}/demo/uncommitted/start?rows=3")
+        check("demo writer holds 3 uncommitted rows",
+              held["held_uncommitted_rows"] == 3)
+        page = json.load(urllib.request.urlopen(
+            f"{base_url}/events?path=/demo/uncommitted"))
+        check("queries see none of the uncommitted rows",
+              page["total"] == 0)
+        st = json.load(urllib.request.urlopen(
+            f"{base_url}/demo/uncommitted/status"))
+        check("writer txn holds 3 rows, committed view sees 0",
+              st["writer_transaction_rows"] == 3
+              and st["committed_visible_to_queries"] == 0, str(st))
+        page = json.load(urllib.request.urlopen(f"{base_url}/events?limit=1"))
+        check("previously committed data still served mid-write",
+              page["total"] == 33 and len(page["items"]) == 1)
+
+        snap = _post(f"{base_url}/demo/snapshot/start")
+        sid = snap["snapshot_id"]
+        check("snapshot pins total at start", snap["total_at_start"] == 33)
+        _post(f"{base_url}/demo/uncommitted/commit")
+        page = json.load(urllib.request.urlopen(
+            f"{base_url}/events?path=/demo/uncommitted"))
+        check("committed rows visible to fresh queries", page["total"] == 3)
+        frozen = json.load(urllib.request.urlopen(
+            f"{base_url}/demo/snapshot/{sid}?limit=10"))
+        check("held snapshot immune to mid-read commit",
+              frozen["page"]["total"] == 33
+              and len(frozen["page"]["items"]) == 10
+              and frozen["page"]["next_offset"] == 10,
+              str({k: frozen["page"][k] for k in ("total", "next_offset")}))
+        # writer commits again while the reader stays paused
+        _post(f"{base_url}/demo/uncommitted/start?rows=2")
+        _post(f"{base_url}/demo/uncommitted/commit")
+        frozen = json.load(urllib.request.urlopen(
+            f"{base_url}/demo/snapshot/{sid}?limit=100"))
+        check("paused reader still sees old total after 2nd commit",
+              frozen["page"]["total"] == 33)
+        _post(f"{base_url}/demo/snapshot/{sid}/close")
+        try:
+            urllib.request.urlopen(f"{base_url}/demo/snapshot/{sid}")
+            check("closed snapshot is released", False, "still readable")
+        except urllib.error.HTTPError as e:
+            check("closed snapshot is released", e.code == 404, str(e.code))
+
+        _post(f"{base_url}/demo/uncommitted/start?rows=4")
+        _post(f"{base_url}/demo/uncommitted/rollback")
+        page = json.load(urllib.request.urlopen(
+            f"{base_url}/events?path=/demo/uncommitted"))
+        check("rolled-back rows vanish (exit before commit)",
+              page["total"] == 5, str(page["total"]))
     finally:
         server.should_exit = True
         t.join(timeout=5)
@@ -493,6 +550,93 @@ def test_multibyte_offsets_and_chunk_boundaries():
         shutil.rmtree(base)
 
 
+def test_read_snapshot_isolation():
+    print("\n[10] 事务隔离：只读已提交 / 单响应同快照 / 读写互不阻塞")
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        f = os.path.join(log_dir, "access.log")
+        with open(f, "w") as fh:
+            fh.write(jline("/committed/1", 200))
+        poll_once(conn, log_dir)
+
+        def n_events(c):
+            return c.execute(
+                "SELECT COUNT(*) AS c FROM log_events").fetchone()["c"]
+
+        def insert_row(c, boff, path="/x", status=500):
+            c.execute(
+                "INSERT INTO log_events (ts, path, status, method, source_code,"
+                " dev, inode, byte_offset, raw_line)"
+                " VALUES ('t', ?, ?, 'GET', 'demo', -1, -1, ?, '{}')",
+                (path, status, boff))
+
+        # (a) writer paused mid-transaction: readers still see committed data
+        w = storage.connect(db_path)
+        w.execute("BEGIN IMMEDIATE")
+        insert_row(w, 0, "/uncommitted")
+        check("writer sees its own uncommitted row", n_events(w) == 2)
+        with storage.read_snapshot(db_path) as r:
+            check("reader sees only committed data during open write txn",
+                  n_events(r) == 1)
+            page = storage.query_events(r, limit=10)
+            check("page consistent while writer paused",
+                  page["total"] == 1 and len(page["items"]) == 1
+                  and page["next_offset"] is None)
+        w.execute("ROLLBACK")
+        w.close()
+        with storage.read_snapshot(db_path) as r:
+            check("rolled-back row never becomes visible", n_events(r) == 1)
+
+        # (b) one response = one snapshot: a commit landing mid-read changes
+        #     nothing inside the open snapshot
+        with storage.read_snapshot(db_path) as snap:
+            before = storage.query_events(snap, limit=100)
+            w2 = storage.connect(db_path)
+            with storage.transaction(w2):
+                for i in range(3):
+                    insert_row(w2, 10 + i, f"/mid/{i}")
+            w2.close()
+            after = storage.query_events(snap, limit=100)
+            check("total stable across mid-read commit",
+                  before["total"] == 1 and after["total"] == 1,
+                  f"{before['total']} -> {after['total']}")
+            check("items identical across mid-read commit",
+                  [i["id"] for i in after["items"]]
+                  == [i["id"] for i in before["items"]])
+            check("next_offset consistent with frozen total",
+                  after["next_offset"] is None)
+        with storage.read_snapshot(db_path) as r:
+            check("fresh snapshot sees the committed rows", n_events(r) == 4)
+
+        # (c) reader paused mid-query does not block the writer
+        with storage.read_snapshot(db_path) as snap:
+            storage.query_events(snap, limit=1)
+            try:
+                w3 = storage.connect(db_path)
+                with storage.transaction(w3):
+                    insert_row(w3, 20, "/while/reading")
+                w3.close()
+                committed_ok = True
+            except sqlite3.Error:
+                committed_ok = False
+            check("writer commits while reader paused mid-query", committed_ok)
+            check("paused reader still on its old snapshot",
+                  n_events(snap) == 4)
+
+        # (d) read resources are released when the snapshot ends
+        with storage.read_snapshot(db_path) as r:
+            r.execute("SELECT 1")
+        try:
+            r.execute("SELECT 1")
+            closed = False
+        except sqlite3.ProgrammingError:
+            closed = True
+        check("snapshot connection released after use", closed)
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
 if __name__ == "__main__":
     test_drain_partial_tail()
     test_rotation_rename()
@@ -503,5 +647,6 @@ if __name__ == "__main__":
     test_api()
     test_offset_math_after_partial()
     test_multibyte_offsets_and_chunk_boundaries()
+    test_read_snapshot_isolation()
     print(f"\n==== {PASS} passed, {FAIL} failed ====")
     sys.exit(1 if FAIL else 0)

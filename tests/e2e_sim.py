@@ -6,6 +6,9 @@
 3. performs a rename rotation with late writes into the old inode
 4. restarts the service and proves resume without gaps/duplicates
 5. exercises every HTTP endpoint with urllib
+6. proves the transaction-isolation contract via the /demo hooks:
+   uncommitted rows invisible, held snapshots consistent across commits,
+   exit-before-commit leaves no trace
 """
 
 from __future__ import annotations
@@ -195,9 +198,56 @@ def main():
                   {"access.log", "access.log.arc1.log"}
                   and all(f["complete"] for f in prog["files"]),
                   str(prog["files"]))
+
+        print("[F] 事务隔离：未提交不可见 / 快照一致 / 回滚消失")
+        post("/demo/uncommitted/start?rows=3")
+        _, p = get("/events?path=/demo/uncommitted")
+        check("uncommitted demo rows invisible to queries", p["total"] == 0)
+        _, st = get("/demo/uncommitted/status")
+        check("writer holds 3, committed view sees 0",
+              st["writer_transaction_rows"] == 3
+              and st["committed_visible_to_queries"] == 0, str(st))
+        _, snap = post("/demo/snapshot/start")
+        sid = snap["snapshot_id"]
+        post("/demo/uncommitted/commit")
+        _, p = get("/events?path=/demo/uncommitted")
+        check("committed demo rows visible", p["total"] == 3)
+        _, sp = get(f"/demo/snapshot/{sid}?limit=10")
+        check("held snapshot frozen across the commit",
+              sp["page"]["total"] == snap["total_at_start"],
+              f"{sp['page']['total']} != {snap['total_at_start']}")
+        post(f"/demo/snapshot/{sid}/close")
+        post("/demo/uncommitted/start?rows=2")
+        post("/demo/uncommitted/rollback")
+        _, p = get("/events?path=/demo/uncommitted")
+        check("rollback leaves no trace", p["total"] == 3)
+
+        print("[G] 提交前退出：未提交事务随进程退出回滚")
+        post("/demo/uncommitted/start?rows=4")
+        _, p = get("/events?path=/demo/uncommitted")
+        check("held rows invisible before exit", p["total"] == 3)
+        _, st = get("/demo/uncommitted/status")
+        check("writer holds 4 uncommitted rows",
+              st["writer_transaction_rows"] == 7, str(st))
     finally:
+        # Graceful exit while a demo transaction is still held: the lifespan
+        # cleanup rolls it back. (A hard kill behaves the same — SQLite
+        # never makes uncommitted WAL frames visible to other connections.)
         srv2.should_exit = True
         t2.join(timeout=10)
+
+    time.sleep(0.3)
+    srv3, t3 = start_server()
+    try:
+        _, p = get("/events?path=/demo/uncommitted")
+        check("uncommitted rows gone after process exit", p["total"] == 3)
+        _, st = get("/demo/uncommitted/status")
+        check("no transaction held after restart",
+              st["holding"] is False
+              and st["committed_visible_to_queries"] == 3, str(st))
+    finally:
+        srv3.should_exit = True
+        t3.join(timeout=10)
         arch_fh.close()
 
     print(f"\n==== E2E {'ALL PASS' if not failures else f'{len(failures)} FAIL'} ====")

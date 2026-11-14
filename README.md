@@ -11,9 +11,20 @@
 | 旧文件轮转后仍被短暂写入 | 旧 inode 继续按已提交偏移采集到 EOF；归档永不删除、不截断 |
 | 读到写了一半的行 | 只入仓以 `\n` 结尾的完整行；未换行尾部保持原偏移，下轮重读 |
 | 进程在写入中途/前后退出 | 行数据与“下一字节偏移”在**同一个 SQLite 事务**提交，重启从最后提交点续采 |
-| 查询读到半成品 | WAL + 事务隔离，查询只能看到已完整提交的事务 |
+| 查询读到采集未提交的记录 | 写连接专属于采集；每次查询响应用**独立连接的读事务**，只能看到已提交数据 |
+| 分页 total 与明细对不上 | 同一响应的 COUNT、明细、`next_offset` 在**同一个读快照**内完成 |
 | 内容相同的两行 | 唯一性只约束物理位置 `(dev,inode,source_code,byte_offset)`，不含内容，重复内容各自成行 |
 | JSON 坏行 | 隔离进 `malformed_lines` 表，不阻断后续行 |
+
+## 事务隔离设计（查询 vs 采集）
+
+| 要求 | 实现 |
+| --- | --- |
+| 只读已提交数据 | 采集独占**唯一写连接**；`/events`、`/events/{id}`、`/malformed`、`/ingest/progress`、`/health` 的每次响应都另开独立只读连接（`PRAGMA query_only=ON`），全部 SELECT 在单个读事务内完成 |
+| 同一响应同一快照 | 读事务在 WAL 下钉住一致快照：分页 `total`、明细、`next_offset` 必然一致；分页中途的采集提交不影响本次响应 |
+| 读写不串行化 | WAL 读写并发：采集写到一半暂停，查询照常返回已提交数据；查询读到一半暂停，采集照常提交（无全局读写锁） |
+| 提交/回滚不污染其他请求 | 连接不共享：任何连接的 COMMIT/ROLLBACK 只影响自己；请求之间互不可见 |
+| 读取资源释放 | `read_snapshot` 上下文管理器保证响应结束或异常都结束读事务并关闭连接；demo 快照另有 TTL 与显式 close |
 
 ## 目录结构
 
@@ -21,12 +32,14 @@
 .
 ├── docker-compose.yml      # nginx + collector + traffic 一键启动
 ├── collector/              # FastAPI + SQLite 采集/查询服务
-│   ├── app/storage.py      # 表结构、事务、查询
+│   ├── app/storage.py      # 表结构、写事务、读快照、查询
 │   ├── app/ingest.py       # 目录扫描、inode 识别、完整行切分、续采
+│   ├── app/demo.py         # 事务隔离可控演示钩子（/demo/*）
 │   └── app/main.py         # API（/docs 可用）
 ├── nginx/                  # JSON 行日志格式 + 可控轮转脚本
 ├── traffic/                # 持续请求生成器（含 4xx/5xx）
-└── tests/                  # 41 项单元/集成断言 + 端到端模拟
+├── scripts/                # verify.sh 校验、rotate.sh 轮转、demo_tx_isolation.sh 隔离演示
+└── tests/                  # 67 项单元/集成断言 + 端到端模拟
 ```
 
 ## 快速开始
@@ -92,6 +105,45 @@ curl -s -X POST localhost:8000/ingest/poll-now
 curl -s localhost:8000/malformed
 ```
 
+## 事务隔离可控样例
+
+三个样例都可以在 http://localhost:8000/docs 的 **demo** 分组里逐步执行，
+也可以一键运行（需要 compose 环境已启动）：
+
+```bash
+./scripts/demo_tx_isolation.sh
+```
+
+### 样例 1：未提交时查询（采集写到一半暂停）
+
+1. `POST /demo/uncommitted/start?rows=5` —— 在独立连接上 `BEGIN` 并写入 5 行，
+   **保持不提交**。（SQLite 单写者：此时后台采集等锁暂停，正是“写到一半”，
+   提交/回滚后立即恢复。）
+2. `GET /events?path=/demo/uncommitted` → `total=0`；
+   `GET /events` 照常返回此前已提交数据。
+3. `GET /demo/uncommitted/status` → 写事务内 5 行 vs 查询可见 0 行。
+4. `POST /demo/uncommitted/commit` → 再查 `total=5`，原子可见。
+
+### 样例 2：分页中途提交（查询读到一半暂停）
+
+1. `POST /demo/snapshot/start` → 记下 `snapshot_id` 与 `total_at_start`。
+2. 提交新行（用样例 1 的 commit，或等正常流量入仓）——
+   **采集在查询暂停期间照常提交**。
+3. `GET /demo/snapshot/{snapshot_id}?limit=10` → `total` 仍等于
+   `total_at_start`，明细数量与 `next_offset` 自洽：同一快照不受中途提交影响。
+4. `POST /demo/snapshot/{snapshot_id}/close` 释放读取资源
+   （5 分钟未关闭也会自动回收）。
+
+### 样例 3：提交前退出
+
+1. `POST /demo/uncommitted/start?rows=4`。
+2. `docker compose restart collector` —— 进程退出，未提交事务随连接消亡回滚。
+3. 再查 `GET /events?path=/demo/uncommitted` —— 没有新增行，与退出前一致。
+
+demo 行 `source_code=demo-hold`、`path=/demo/uncommitted`，不影响正常采集与筛选；
+`docker compose down -v` 可清空全部演示数据。demo 钩子仅用于演示/测试，
+生产部署在 `app/main.py` 移除 `app.include_router(demo_router)` 一行即可关闭。
+
 ## API 一览
 
 | 方法 | 路径 | 用途 |
@@ -102,6 +154,13 @@ curl -s localhost:8000/malformed
 | GET | `/events` | 分页取数，支持 `path`、`status`、`status_min/max`、`source_code`、`limit`、`offset` |
 | GET | `/events/{id}` | 单条事件（含原始 JSON 行 `raw_line`） |
 | GET | `/malformed` | 坏行隔离区 |
+| POST | `/demo/uncommitted/start` | （演示）按住一个未提交写事务（`rows` 行写入后不提交） |
+| GET | `/demo/uncommitted/status` | （演示）写事务内计数 vs 查询可见计数 |
+| POST | `/demo/uncommitted/commit` | （演示）提交被按住的事务 |
+| POST | `/demo/uncommitted/rollback` | （演示）回滚被按住的事务（等价于提交前退出） |
+| POST | `/demo/snapshot/start` | （演示）按住一个读快照，返回 `snapshot_id` |
+| GET | `/demo/snapshot/{id}` | （演示）在按住的快照内分页查询 |
+| POST | `/demo/snapshot/{id}/close` | （演示）释放快照 |
 
 ## 数据模型
 
@@ -116,7 +175,8 @@ malformed_lines(..., raw_line, error)                            -- 坏行隔离
 - `byte_offset`：该行在其来源文件中的起始字节位置。
 - 唯一索引 `(dev, inode, source_code, byte_offset)` 是防重的最后防线；
   内容不在键中，所以两行完全相同也分别保留。
-- SQLite 运行在 `WAL + synchronous=FULL`：提交即落盘，读不阻塞写。
+- SQLite 运行在 `WAL + synchronous=FULL`：提交即落盘，读不阻塞写、写不阻塞读
+  （查询侧的快照隔离见上文「事务隔离设计」）。
 
 ## 配置（环境变量）
 
@@ -134,12 +194,14 @@ malformed_lines(..., raw_line, error)                            -- 坏行隔离
 python3 -m venv --without-pip .venv && . .venv/bin/activate
 # 若 venv 内无 pip：python get-pip.py
 pip install -r collector/requirements.txt httpx pyyaml
-python -I tests/test_collector.py   # 41 项：部分行/轮转/崩溃恢复/重复行/API
-python -I tests/e2e_sim.py          # 完整服务启停 + 轮转 + 重启续采 E2E
+python -I tests/test_collector.py   # 67 项：部分行/轮转/崩溃恢复/重复行/API/事务隔离
+python -I tests/e2e_sim.py          # 完整服务启停 + 轮转 + 重启续采 + 隔离样例 E2E
 ```
 
 覆盖的关键场景：未换行尾部等待补齐、rename 轮转双 inode、旧 inode 延迟写入、
-20 轮随机“进程退出”后续采不漏不重、相同内容多行保留、坏行隔离、分页与过滤。
+20 轮随机“进程退出”后续采不漏不重、相同内容多行保留、坏行隔离、分页与过滤、
+未提交数据对查询不可见、单响应快照一致（total/明细/next_offset）、
+读写并发互不阻塞、提交前退出回滚不留痕。
 
 ## 故障排查
 

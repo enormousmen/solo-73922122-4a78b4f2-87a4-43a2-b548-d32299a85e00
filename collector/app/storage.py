@@ -12,6 +12,26 @@ the database in one of two states:
 On restart the collector resumes exactly at the last committed offset, which
 guarantees no line is recorded twice and no line is skipped.
 
+Isolation contract
+------------------
+Exactly **one writer connection** exists (owned by the collector loop and
+``POST /ingest/poll-now``); HTTP queries never touch it. Every query
+response is served from a short-lived **read snapshot** — a dedicated
+connection that runs all of the response's SELECTs inside a single
+deferred read transaction. Under WAL that transaction pins a consistent
+snapshot of committed data, so:
+
+* queries only ever see committed rows, never a half-written transaction
+  (a row whose writer later rolls back is never observed);
+* ``total``, the page items and ``next_offset`` of one response always
+  come from the same snapshot, even if the collector commits mid-request;
+* readers and the writer proceed concurrently — a writer paused
+  mid-transaction does not block queries, and a query paused mid-read
+  does not block commits (reads and writes are *not* serialised);
+* a commit or rollback on one connection can never leak into another
+  request, and every snapshot is ended and its connection closed when the
+  request finishes or fails.
+
 WAL + ``synchronous=FULL`` make committed data survive process/container
 crashes and power loss while still allowing the API to read while the
 ingestor is writing.
@@ -78,9 +98,12 @@ CREATE TABLE IF NOT EXISTS malformed_lines (
 
 
 def connect(db_path: str) -> sqlite3.Connection:
-    # check_same_thread=False: the ingestor runs in a background thread while
-    # FastAPI request handlers run in the threadpool. Writes are serialised by
-    # CollectorLoop.write_lock; WAL permits those writes alongside readers.
+    """The single *writer* connection (collector loop / POST /ingest/poll-now).
+
+    check_same_thread=False: the ingestor runs in a background thread while
+    the poll-now handler runs in the threadpool. Writes are serialised by
+    CollectorLoop.write_lock; WAL permits those writes alongside readers.
+    """
     conn = sqlite3.connect(
         db_path, timeout=10, isolation_level=None, check_same_thread=False
     )
@@ -90,6 +113,47 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
     return conn
+
+
+def connect_reader(db_path: str) -> sqlite3.Connection:
+    """A fresh read-only connection for a single query response.
+
+    ``query_only`` makes it impossible for a request to write by accident.
+    WAL mode (already persisted in the database file by :func:`connect`)
+    lets it read committed data while the writer is mid-transaction, and
+    never blocks — nor is blocked by — the writer.
+    """
+    conn = sqlite3.connect(
+        db_path, timeout=10, isolation_level=None, check_same_thread=False
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
+@contextmanager
+def read_snapshot(db_path: str) -> Iterator[sqlite3.Connection]:
+    """Yield a connection whose reads all share one committed-only snapshot.
+
+    All SELECTs of one response run inside a single deferred transaction on
+    a dedicated connection, so a concurrent commit neither becomes visible
+    halfway through the response nor blocks this reader. The transaction is
+    always ended and the connection closed — even when the handler raises —
+    so no read resource outlives the request.
+    """
+    conn = connect_reader(db_path)
+    try:
+        conn.execute("BEGIN")
+        try:
+            yield conn
+        finally:
+            try:
+                conn.execute("ROLLBACK")  # end the read transaction
+            except sqlite3.Error:
+                pass
+    finally:
+        conn.close()
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -133,6 +197,13 @@ def query_events(
     limit: int = 100,
     offset: int = 0,
 ) -> dict[str, Any]:
+    """Paginated event query.
+
+    ``conn`` must be inside a read transaction (see :func:`read_snapshot`)
+    so the COUNT and the page SELECT observe the same snapshot — ``total``,
+    ``items`` and ``next_offset`` are always mutually consistent, even if
+    the collector commits between them.
+    """
     where: list[str] = []
     params: list[Any] = []
     if path is not None:
@@ -165,6 +236,32 @@ def query_events(
         [*params, limit, offset],
     ).fetchall()
 
+    next_offset = offset + limit if offset + limit < total else None
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "next_offset": next_offset,
+        "items": [dict(r) for r in rows],
+    }
+
+
+def query_malformed(
+    conn: sqlite3.Connection, *, limit: int = 100, offset: int = 0
+) -> dict[str, Any]:
+    """Paginated view of the quarantine table.
+
+    Same snapshot rules as :func:`query_events`: COUNT and the page SELECT
+    run in the caller's read transaction, so the page metadata can never
+    disagree with the rows returned.
+    """
+    total = conn.execute(
+        "SELECT COUNT(*) AS c FROM malformed_lines"
+    ).fetchone()["c"]
+    rows = conn.execute(
+        "SELECT * FROM malformed_lines ORDER BY id LIMIT ? OFFSET ?",
+        (limit, offset),
+    ).fetchall()
     next_offset = offset + limit if offset + limit < total else None
     return {
         "total": total,
